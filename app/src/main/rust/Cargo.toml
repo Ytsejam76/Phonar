@@ -1,0 +1,12 @@
+[package]
+name = "phonar-native"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "phonar_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+batkit = { git = "https://github.com/Ytsejam76/BatKit", rev = "b53dcc1ace25a4ed66f0827fe895180de9a35efe" }
+jni = "0.21.1"

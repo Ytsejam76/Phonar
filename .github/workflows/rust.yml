@@ -1,0 +1,27 @@
+name: Rust
+
+on:
+  push:
+    branches: ["mainline"]
+  pull_request:
+    branches: ["mainline"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --locked --manifest-path app/src/main/rust/Cargo.toml
