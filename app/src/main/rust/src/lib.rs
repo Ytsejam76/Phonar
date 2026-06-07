@@ -78,9 +78,16 @@ extern "system" fn analyze(
         return to_java_array(&mut env, &fallback);
     };
     let echo_guard = sample_rate as usize / 2_000;
+    let max_echo_delay = sample_rate as usize / 10;
+    let echo_start = direct.index.saturating_add(echo_guard);
+    let echo_end = direct
+        .index
+        .saturating_add(max_echo_delay)
+        .min(correlation.len().saturating_sub(1));
+
     let echo = peaks
         .iter()
-        .filter(|peak| peak.index > direct.index + echo_guard)
+        .filter(|peak| peak.index >= echo_start && peak.index <= echo_end)
         .max_by(|a, b| a.value.total_cmp(&b.value));
 
     let Some(echo) = echo else {

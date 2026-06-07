@@ -8,13 +8,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.FastOutSlowInEasing
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -34,13 +27,17 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,8 +52,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.ytsejam.phonar.ui.theme.PhonarTheme
-import kotlinx.coroutines.async
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.PI
@@ -93,6 +91,9 @@ private fun PhonarScreen(hasPermission: Boolean) {
     var permissionGranted by remember { mutableStateOf(hasPermission) }
     var phase by remember { mutableStateOf(ScanPhase.Idle) }
     var pingCount by remember { mutableIntStateOf(0) }
+    var transmitVolume by rememberSaveable { mutableFloatStateOf(0.8f) }
+    var scanSweep by remember { mutableFloatStateOf(0f) }
+    var scanWave by remember { mutableFloatStateOf(0f) }
     var reading by remember { mutableStateOf<SonarReading?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
 
@@ -114,27 +115,43 @@ private fun PhonarScreen(hasPermission: Boolean) {
 
         if (phase == ScanPhase.Scanning) return
 
+        phase = ScanPhase.Scanning
+        pingCount = 0
+        scanSweep = 0f
+        scanWave = 0f
         reading = null
         error = null
-        pingCount = 0
-        phase = ScanPhase.Scanning
 
         scope.launch {
-            runCatching {
-                val measurement = async { engine.measure(pingCount = 3) }
-
-                repeat(3) { index ->
-                    pingCount = index + 1
-                    delay(190)
+            val scanJob: Job = launch {
+                var ticks = 0
+                while (isActive && phase == ScanPhase.Scanning) {
+                    scanSweep = (scanSweep + 7f) % 360f
+                    scanWave = (scanWave + 0.035f) % 1f
+                    if (ticks % 6 == 0 && pingCount < 3) {
+                        pingCount += 1
+                    }
+                    ticks += 1
+                    delay(32)
                 }
+            }
 
-                reading = measurement.await()
+            try {
+                reading = engine.measure(pingCount = 3, volume = transmitVolume)
                 phase = ScanPhase.Result
-            }.onFailure {
-                error = it.message ?: "Measurement failed"
+            } catch (t: Throwable) {
+                error = t.message ?: "Measurement failed"
                 phase = ScanPhase.Error
+            } finally {
+                scanJob.cancel()
             }
         }
+    }
+
+    LaunchedEffect(phase) {
+        if (phase != ScanPhase.Idle) return@LaunchedEffect
+        scanSweep = 0f
+        scanWave = 0f
     }
 
     Scaffold { innerPadding ->
@@ -162,14 +179,35 @@ private fun PhonarScreen(hasPermission: Boolean) {
                 color = Color(0xFFE8FFF0),
             )
             Text(
-                text = "Tap to send a sonar burst and lock onto the echo",
+                text = "Tap once to send a sonar sweep and lock the echo",
                 color = Color(0xFF9CC9BE),
                 textAlign = TextAlign.Center,
             )
 
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF091716)),
+            ) {
+                Column(modifier = Modifier.padding(18.dp)) {
+                    Text(
+                        text = String.format(Locale.US, "Ping volume: %.0f%%", transmitVolume * 100f),
+                        color = Color(0xFFE8FFF0),
+                    )
+                    Slider(
+                        value = transmitVolume,
+                        onValueChange = { transmitVolume = it },
+                        valueRange = 0.05f..1f,
+                        steps = 0,
+                    )
+                }
+            }
+
             SonarRadarCard(
                 phase = phase,
                 pingCount = pingCount,
+                sweep = scanSweep,
+                wave = scanWave,
                 reading = reading,
                 error = error,
             )
@@ -194,7 +232,7 @@ private fun PhonarScreen(hasPermission: Boolean) {
 
             Text(
                 text = when (phase) {
-                    ScanPhase.Idle -> "Ready. Volume should be moderate."
+                    ScanPhase.Idle -> "Ready. Keep volume moderate."
                     ScanPhase.Scanning -> "Ping $pingCount / 3"
                     ScanPhase.Result -> reading?.let {
                         String.format(Locale.US, "Estimated distance: %.2f m", it.distanceMeters)
@@ -212,29 +250,11 @@ private fun PhonarScreen(hasPermission: Boolean) {
 private fun SonarRadarCard(
     phase: ScanPhase,
     pingCount: Int,
+    sweep: Float,
+    wave: Float,
     reading: SonarReading?,
     error: String?,
 ) {
-    val transition = rememberInfiniteTransition(label = "radar")
-    val sweep by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 2400, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart,
-        ),
-        label = "sweep",
-    )
-    val wavePhase by transition.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 1000, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Restart,
-        ),
-        label = "wave",
-    )
-
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -260,7 +280,6 @@ private fun SonarRadarCard(
                     val accent = Color(0xFF7CFF43)
                     val dimAccent = Color(0xFF7CFF43).copy(alpha = 0.22f)
                     val grid = Color(0xFF78D0C0).copy(alpha = 0.15f)
-                    val sweepAngle = sweep
 
                     drawRect(
                         brush = Brush.radialGradient(
@@ -273,7 +292,7 @@ private fun SonarRadarCard(
 
                     drawCircle(
                         color = Color(0xFF0B1B18),
-                        radius = radius * 1.18f,
+                        radius = radius * 1.16f,
                         center = center,
                     )
                     drawCircle(
@@ -283,7 +302,7 @@ private fun SonarRadarCard(
                         style = Stroke(width = 7f),
                     )
 
-                    for (fraction in listOf(0.25f, 0.5f, 0.75f, 1f)) {
+                    for (fraction in listOf(0.48f, 0.76f, 0.98f)) {
                         drawCircle(
                             color = grid,
                             radius = radius * fraction,
@@ -299,56 +318,54 @@ private fun SonarRadarCard(
                         strokeWidth = 2f,
                         cap = StrokeCap.Round,
                     )
-                    drawLine(
-                        color = grid,
-                        start = Offset(center.x, center.y - radius),
-                        end = Offset(center.x, center.y + radius),
-                        strokeWidth = 2f,
-                        cap = StrokeCap.Round,
-                    )
 
-                    val sweepRad = sweepAngle * (PI / 180f).toFloat()
-                    val sweepLength = radius * 0.98f
-                    val sweepEnd = Offset(
-                        x = center.x + cos(sweepRad) * sweepLength,
-                        y = center.y + sin(sweepRad) * sweepLength,
-                    )
-                    drawArc(
-                        color = accent.copy(alpha = 0.18f),
-                        startAngle = sweepAngle - 18f,
-                        sweepAngle = 34f,
-                        useCenter = true,
-                        size = Size(radius * 2f, radius * 2f),
-                        topLeft = Offset(center.x - radius, center.y - radius),
-                    )
-                    drawLine(
-                        color = accent,
-                        start = center,
-                        end = sweepEnd,
-                        strokeWidth = 5f,
-                        cap = StrokeCap.Round,
-                    )
+                    if (phase == ScanPhase.Scanning) {
+                        val sweepRad = sweep * (PI / 180f).toFloat()
+                        val sweepLength = radius * 0.98f
+                        val sweepEnd = Offset(
+                            x = center.x + cos(sweepRad) * sweepLength,
+                            y = center.y + sin(sweepRad) * sweepLength,
+                        )
+                        drawArc(
+                            color = accent.copy(alpha = 0.16f),
+                            startAngle = sweep - 14f,
+                            sweepAngle = 28f,
+                            useCenter = true,
+                            size = Size(radius * 2f, radius * 2f),
+                            topLeft = Offset(center.x - radius, center.y - radius),
+                        )
+                        drawLine(
+                            color = accent,
+                            start = center,
+                            end = sweepEnd,
+                            strokeWidth = 5f,
+                            cap = StrokeCap.Round,
+                        )
+                    }
+
                     drawCircle(
                         color = Color(0xFFE6FFB8),
                         radius = 7f,
                         center = center,
                     )
 
-                    repeat(3) { index ->
-                        val pulseOffset = ((wavePhase + index * 0.32f) % 1f)
-                        val pulseRadius = radius * (0.18f + pulseOffset * 0.62f)
-                        val alpha = (0.34f - index * 0.08f).coerceAtLeast(0.08f) * (1f - pulseOffset)
-                        drawCircle(
-                            color = dimAccent.copy(alpha = alpha),
-                            radius = pulseRadius,
-                            center = center,
-                            style = Stroke(width = 4f),
-                        )
+                    if (phase == ScanPhase.Scanning) {
+                        repeat(2) { index ->
+                            val pulseOffset = ((wave + index * 0.45f) % 1f)
+                            val pulseRadius = radius * (0.24f + pulseOffset * 0.54f)
+                            val alpha = (0.26f - index * 0.08f).coerceAtLeast(0.06f) * (1f - pulseOffset)
+                            drawCircle(
+                                color = dimAccent.copy(alpha = alpha),
+                                radius = pulseRadius,
+                                center = center,
+                                style = Stroke(width = 4f),
+                            )
+                        }
                     }
 
                     if (pingCount > 0) {
-                        repeat(pingCount) { index ->
-                            val pulseRadius = radius * (0.22f + index * 0.09f)
+                        repeat(pingCount.coerceAtMost(3)) { index ->
+                            val pulseRadius = radius * (0.22f + index * 0.10f)
                             drawCircle(
                                 color = accent.copy(alpha = 0.20f - index * 0.04f),
                                 radius = pulseRadius,
@@ -362,24 +379,28 @@ private fun SonarRadarCard(
                     val echoRadius = radius * 0.55f
                     val echoX = center.x + cos(echoAngle * (PI / 180f).toFloat()) * echoRadius
                     val echoY = center.y + sin(echoAngle * (PI / 180f).toFloat()) * echoRadius
-                    if (reading != null && reading.distanceMeters >= 0f) {
-                        drawCircle(
-                            color = Color(0xFFD6FF9A),
-                            radius = 11f,
-                            center = Offset(echoX, echoY),
-                        )
-                        drawCircle(
-                            color = Color(0xFF8CFF3F).copy(alpha = 0.55f),
-                            radius = 24f,
-                            center = Offset(echoX, echoY),
-                            style = Stroke(width = 3f),
-                        )
-                    } else if (phase == ScanPhase.Error) {
-                        drawCircle(
-                            color = Color(0xFFFF7F7F),
-                            radius = 10f,
-                            center = Offset(echoX, echoY),
-                        )
+                    when {
+                        reading != null && reading.distanceMeters >= 0f -> {
+                            drawCircle(
+                                color = Color(0xFFD6FF9A),
+                                radius = 11f,
+                                center = Offset(echoX, echoY),
+                            )
+                            drawCircle(
+                                color = Color(0xFF8CFF3F).copy(alpha = 0.55f),
+                                radius = 24f,
+                                center = Offset(echoX, echoY),
+                                style = Stroke(width = 3f),
+                            )
+                        }
+
+                        phase == ScanPhase.Error -> {
+                            drawCircle(
+                                color = Color(0xFFFF7F7F),
+                                radius = 10f,
+                                center = Offset(echoX, echoY),
+                            )
+                        }
                     }
                 }
             }
@@ -407,14 +428,14 @@ private fun SonarRadarCard(
                     .fillMaxWidth()
                     .height(64.dp),
             ) {
-                val barCount = 26
+                val barCount = 14
                 val gap = size.width / barCount
                 val maxHeight = size.height * 0.85f
                 for (index in 0 until barCount) {
                     val normalized = index / (barCount - 1f)
-                    val wave = sin((normalized * 7.2f + wavePhase * 9f) * PI).toFloat()
-                    val scanBoost = if (phase == ScanPhase.Scanning) 0.25f else 0.12f
-                    val height = (maxHeight * (0.18f + scanBoost + wave * 0.22f)).coerceAtLeast(8f)
+                    val barWave = sin((normalized * 5.5f + wave * 6.0f) * PI).toFloat()
+                    val scanBoost = if (phase == ScanPhase.Scanning) 0.24f else 0.10f
+                    val height = (maxHeight * (0.20f + scanBoost + barWave * 0.18f)).coerceAtLeast(8f)
                     val left = index * gap + gap * 0.22f
                     drawRoundRect(
                         color = Color(0xFF7CFF43).copy(alpha = 0.18f + normalized * 0.35f),

@@ -2,11 +2,12 @@
 package com.ytsejam.phonar
 
 import android.annotation.SuppressLint
-import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.ToneGenerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -18,115 +19,133 @@ data class SonarReading(
 
 class SonarEngine {
     private val sampleRate = 48_000
+    private val pingCueMillis = 80
+    private val settleMillis = 120L
+    private val betweenTrialsMillis = 180L
 
     @SuppressLint("MissingPermission")
-    suspend fun measure(pingCount: Int = 3): SonarReading = withContext(Dispatchers.IO) {
+    suspend fun measure(pingCount: Int = 3, volume: Float = 0.8f): SonarReading = withContext(Dispatchers.IO) {
+        val trials = pingCount.coerceAtLeast(1)
+        val results = ArrayList<SonarReading>(trials)
+        val toneGenerator = runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 80) }.getOrNull()
+
+        try {
+            repeat(trials) { trialIndex ->
+                toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, pingCueMillis)
+                delay(settleMillis)
+                results += runTrial(volume)
+                toneGenerator?.startTone(ToneGenerator.TONE_PROP_ACK, 60)
+
+                if (trialIndex < trials - 1) {
+                    delay(betweenTrialsMillis)
+                }
+            }
+        } catch (t: Throwable) {
+            toneGenerator?.startTone(ToneGenerator.TONE_PROP_NACK, 120)
+            throw t
+        } finally {
+            toneGenerator?.release()
+        }
+
+        val distance = results.map { it.distanceMeters }.average().toFloat()
+        val confidence = results.map { it.confidence }.average().toFloat()
+        SonarReading(distance, confidence)
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun runTrial(volume: Float): SonarReading {
         val probe = BatKitNative.generateProbe(sampleRate)
-        val pingSpacingMs = 170L
-        val settleMs = 250L
-        val silenceSamples = (sampleRate * pingSpacingMs / 1_000L).toInt()
-        val settleSamples = (sampleRate * settleMs / 1_000L).toInt()
-        val train = buildPingTrain(probe, pingCount, silenceSamples, settleSamples)
-        val recordSamples = train.size + sampleRate / 4
-        val minBufferBytes = AudioRecord.getMinBufferSize(
+        check(probe.isNotEmpty()) { "BatKit returned an empty probe" }
+
+        val pingPcm16 = toPcm16(probe)
+        val minPlay = AudioTrack.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+        )
+        check(minPlay > 0) { "Hardware rejected playback config: $sampleRate Hz" }
+
+        val minRec = AudioRecord.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_FLOAT,
+            AudioFormat.ENCODING_PCM_16BIT,
         )
+        check(minRec > 0) { "Hardware rejected recording config: $sampleRate Hz" }
 
-        check(minBufferBytes > 0) { "48 kHz float recording is not supported" }
-
+        val recordSamples = sampleRate * 3 / 4
         val recorder = AudioRecord.Builder()
-            .setAudioSource(MediaRecorder.AudioSource.UNPROCESSED)
+            .setAudioSource(MediaRecorder.AudioSource.MIC)
             .setAudioFormat(
                 AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
                     .setSampleRate(sampleRate)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
                     .build(),
             )
-            .setBufferSizeInBytes(maxOf(minBufferBytes, recordSamples * Float.SIZE_BYTES))
+            .setBufferSizeInBytes(maxOf(minRec, recordSamples * Short.SIZE_BYTES))
             .build()
 
-        val player = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                    .build(),
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build(),
-            )
-            .setTransferMode(AudioTrack.MODE_STATIC)
-            .setBufferSizeInBytes(train.size * Float.SIZE_BYTES)
-            .build()
+        check(recorder.state == AudioRecord.STATE_INITIALIZED) { "Microphone initialization failed" }
+
+        val player = AudioTrack(
+            AudioManager.STREAM_MUSIC,
+            sampleRate,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            maxOf(minPlay, pingPcm16.size * Short.SIZE_BYTES),
+            AudioTrack.MODE_STREAM,
+        )
+
+        if (player.state != AudioTrack.STATE_INITIALIZED) {
+            recorder.release()
+            throw IllegalStateException("Speaker initialization failed")
+        }
 
         try {
-            check(recorder.state == AudioRecord.STATE_INITIALIZED) { "Microphone initialization failed" }
-            check(player.state == AudioTrack.STATE_INITIALIZED) { "Speaker initialization failed" }
-            check(player.write(train, 0, train.size, AudioTrack.WRITE_BLOCKING) == train.size) {
-                "Could not load the ping train"
-            }
+            player.setVolume(volume.coerceIn(0f, 1f))
 
-            val recording = FloatArray(recordSamples)
             recorder.startRecording()
-            delay(40)
+            delay(30)
             player.play()
 
+            check(
+                player.write(pingPcm16, 0, pingPcm16.size, AudioTrack.WRITE_BLOCKING) == pingPcm16.size
+            ) { "Could not load the ping" }
+
+            val recordingPcm16 = ShortArray(recordSamples)
             var offset = 0
-            while (offset < recording.size) {
+            while (offset < recordingPcm16.size) {
                 val count = recorder.read(
-                    recording,
+                    recordingPcm16,
                     offset,
-                    recording.size - offset,
+                    recordingPcm16.size - offset,
                     AudioRecord.READ_BLOCKING,
                 )
-                check(count > 0) { "Microphone read failed: $count" }
+                if (count <= 0) break
                 offset += count
             }
 
-            val result = BatKitNative.analyze(recording, sampleRate)
-            SonarReading(result[0], result[1])
+            check(offset > 0) { "No audio captured from the microphone" }
+
+            val floatRec = FloatArray(offset) { recordingPcm16[it] / 32768f }
+            val result = BatKitNative.analyze(floatRec, sampleRate)
+            return SonarReading(result[0], result[1])
         } finally {
-            if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) recorder.stop()
+            try {
+                recorder.stop()
+            } catch (_: Exception) {
+            }
             recorder.release()
+            try {
+                player.stop()
+            } catch (_: Exception) {
+            }
             player.release()
         }
     }
 
-    private fun buildPingTrain(
-        probe: FloatArray,
-        pingCount: Int,
-        silenceSamples: Int,
-        settleSamples: Int,
-    ): FloatArray {
-        val count = pingCount.coerceAtLeast(1)
-        val totalSize = count * probe.size + (count - 1) * silenceSamples + settleSamples
-        val train = FloatArray(totalSize)
-        var offset = 0
-
-        for (i in 0 until count) {
-            val gain = when (i) {
-                0 -> 1.0f
-                1 -> 0.85f
-                else -> 0.70f
-            }
-
-            for (sample in probe) {
-                train[offset++] = sample * gain
-            }
-
-            if (i < count - 1) {
-                offset += silenceSamples
-            }
-        }
-
-        return train
+    private fun toPcm16(samples: FloatArray): ShortArray = ShortArray(samples.size) {
+        (samples[it].coerceIn(-1f, 1f) * 32767).toInt().toShort()
     }
 }
 
