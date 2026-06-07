@@ -11,20 +11,44 @@ import android.media.ToneGenerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlin.math.abs
 
 data class SonarReading(
     val distanceMeters: Float,
     val confidence: Float,
+    val directCorrelation: Float,
+    val echoCorrelation: Float,
+    val autocorrelationBins: FloatArray,
+)
+
+enum class ProbeKind {
+    Chirp,
+    Ping,
+}
+
+data class ProbeSpec(
+    val kind: ProbeKind = ProbeKind.Chirp,
+    val chirpDurationMs: Float = 40f,
+    val chirpStartHz: Float = 16_000f,
+    val chirpEndHz: Float = 22_000f,
+    val pingDurationMs: Float = 120f,
+    val pingHz: Float = 18_000f,
+    val pingDecay: Float = 6f,
 )
 
 class SonarEngine {
     private val sampleRate = 48_000
-    private val pingCueMillis = 80
+    private val pingCueMillis = 40
     private val settleMillis = 120L
     private val betweenTrialsMillis = 180L
 
     @SuppressLint("MissingPermission")
-    suspend fun measure(pingCount: Int = 3, volume: Float = 0.8f): SonarReading = withContext(Dispatchers.IO) {
+    suspend fun measure(
+        probe: ProbeSpec = ProbeSpec(),
+        pingCount: Int = 3,
+        volume: Float = 0.8f,
+        onPing: suspend (Int) -> Unit = {},
+    ): SonarReading = withContext(Dispatchers.IO) {
         val trials = pingCount.coerceAtLeast(1)
         val results = ArrayList<SonarReading>(trials)
         val toneGenerator = runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, 80) }.getOrNull()
@@ -33,7 +57,9 @@ class SonarEngine {
             repeat(trials) { trialIndex ->
                 toneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, pingCueMillis)
                 delay(settleMillis)
-                results += runTrial(volume)
+                results += runTrial(probe, volume) {
+                    onPing(trialIndex + 1)
+                }
                 toneGenerator?.startTone(ToneGenerator.TONE_PROP_ACK, 60)
 
                 if (trialIndex < trials - 1) {
@@ -47,17 +73,42 @@ class SonarEngine {
             toneGenerator?.release()
         }
 
-        val distance = results.map { it.distanceMeters }.average().toFloat()
-        val confidence = results.map { it.confidence }.average().toFloat()
-        SonarReading(distance, confidence)
+        val stable = results.filter { it.confidence >= 0.2f }.ifEmpty { results }
+        check(stable.isNotEmpty()) { "No stable echo detected" }
+
+        val sortedDistances = stable.map { it.distanceMeters }.sorted()
+        val medianDistance = sortedDistances[sortedDistances.size / 2]
+        val accepted = stable.filter { reading ->
+            abs(reading.distanceMeters - medianDistance) <= maxOf(0.35f, medianDistance * 0.20f)
+        }
+        check(accepted.isNotEmpty()) { "Echo estimate unstable" }
+        if (accepted.size < trials.coerceAtLeast(2) / 2 && stable.size > 1) {
+            throw IllegalStateException("Echo estimate unstable")
+        }
+
+        val weightSum = accepted.sumOf { it.confidence.toDouble() }.coerceAtLeast(1e-6)
+        val weightedDistance = accepted.sumOf { (it.distanceMeters * it.confidence).toDouble() }
+        val distance = (weightedDistance / weightSum).toFloat()
+        val confidence = accepted.maxOf { it.confidence }
+        val directCorrelation = (accepted.sumOf { it.directCorrelation.toDouble() } / accepted.size).toFloat()
+        val echoCorrelation = (accepted.sumOf { it.echoCorrelation.toDouble() } / accepted.size).toFloat()
+        val autocorrelationBins = FloatArray(accepted.first().autocorrelationBins.size) { index ->
+            accepted.sumOf { it.autocorrelationBins[index].toDouble() }.let { total ->
+                (total / accepted.size).toFloat()
+            }
+        }
+        SonarReading(distance, confidence, directCorrelation, echoCorrelation, autocorrelationBins)
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun runTrial(volume: Float): SonarReading {
-        val probe = BatKitNative.generateProbe(sampleRate)
-        check(probe.isNotEmpty()) { "BatKit returned an empty probe" }
+    private suspend fun runTrial(
+        probe: ProbeSpec,
+        volume: Float,
+        onPing: suspend () -> Unit,
+    ): SonarReading {
+        val probePcm16 = generateProbe(probe)
+        check(probePcm16.isNotEmpty()) { "BatKit returned an empty probe" }
 
-        val pingPcm16 = toPcm16(probe)
         val minPlay = AudioTrack.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
@@ -92,7 +143,7 @@ class SonarEngine {
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT,
-            maxOf(minPlay, pingPcm16.size * Short.SIZE_BYTES),
+            maxOf(minPlay, probePcm16.size * Short.SIZE_BYTES),
             AudioTrack.MODE_STREAM,
         )
 
@@ -109,8 +160,9 @@ class SonarEngine {
             player.play()
 
             check(
-                player.write(pingPcm16, 0, pingPcm16.size, AudioTrack.WRITE_BLOCKING) == pingPcm16.size
+                player.write(probePcm16, 0, probePcm16.size, AudioTrack.WRITE_BLOCKING) == probePcm16.size
             ) { "Could not load the ping" }
+            onPing()
 
             val recordingPcm16 = ShortArray(recordSamples)
             var offset = 0
@@ -128,8 +180,18 @@ class SonarEngine {
             check(offset > 0) { "No audio captured from the microphone" }
 
             val floatRec = FloatArray(offset) { recordingPcm16[it] / 32768f }
-            val result = BatKitNative.analyze(floatRec, sampleRate)
-            return SonarReading(result[0], result[1])
+            val (durationMs, primaryHz, secondaryHz, decay) = probe.nativeArgs()
+            val result = BatKitNative.analyze(
+                floatRec,
+                sampleRate,
+                probe.kind.ordinal,
+                durationMs,
+                primaryHz,
+                secondaryHz,
+                decay,
+            )
+            val bins = FloatArray(result.size - 4) { index -> result[index + 4] }
+            return SonarReading(result[0], result[1], result[2], result[3], bins)
         } finally {
             try {
                 recorder.stop()
@@ -144,9 +206,35 @@ class SonarEngine {
         }
     }
 
-    private fun toPcm16(samples: FloatArray): ShortArray = ShortArray(samples.size) {
-        (samples[it].coerceIn(-1f, 1f) * 32767).toInt().toShort()
+    private fun generateProbe(probe: ProbeSpec): ShortArray {
+        val (durationMs, primaryHz, secondaryHz, decay) = probe.nativeArgs()
+        val samples = BatKitNative.generateProbe(
+            sampleRate,
+            probe.kind.ordinal,
+            durationMs,
+            primaryHz,
+            secondaryHz,
+            decay,
+        )
+
+        return ShortArray(samples.size) {
+            (samples[it].coerceIn(-1f, 1f) * 32767).toInt().toShort()
+        }
     }
+
+    private fun ProbeSpec.nativeArgs(): Quadruple {
+        return when (kind) {
+            ProbeKind.Chirp -> Quadruple(chirpDurationMs, chirpStartHz, chirpEndHz, 0f)
+            ProbeKind.Ping -> Quadruple(pingDurationMs, pingHz, 0f, pingDecay)
+        }
+    }
+
+    private data class Quadruple(
+        val durationMs: Float,
+        val primaryHz: Float,
+        val secondaryHz: Float,
+        val decay: Float,
+    )
 }
 
 // vim: set ts=4 sw=4 et:

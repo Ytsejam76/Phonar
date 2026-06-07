@@ -8,5 +8,5 @@ name = "phonar_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-batkit = { git = "https://github.com/Ytsejam76/BatKit", rev = "b53dcc1ace25a4ed66f0827fe895180de9a35efe" }
+batkit = { git = "https://github.com/Ytsejam76/BatKit", rev = "c7e16cdf588d8a21b78b0b6c91e3d5e6f7056b93" }
 jni = "0.21.1"

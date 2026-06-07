@@ -6,10 +6,25 @@ object BatKitNative {
         System.loadLibrary("phonar_native")
     }
 
-    external fun generateProbe(sampleRate: Int): FloatArray
+    external fun generateProbe(
+        sampleRate: Int,
+        probeKind: Int,
+        durationMs: Float,
+        primaryHz: Float,
+        secondaryHz: Float,
+        decay: Float,
+    ): FloatArray
 
-    /** Returns distance in meters and correlation confidence, or [-1, 0]. */
-    external fun analyze(recording: FloatArray, sampleRate: Int): FloatArray
+    /** Returns distance, confidence, direct peak, echo peak, and 14 correlation bins. */
+    external fun analyze(
+        recording: FloatArray,
+        sampleRate: Int,
+        probeKind: Int,
+        durationMs: Float,
+        primaryHz: Float,
+        secondaryHz: Float,
+        decay: Float,
+    ): FloatArray
 }
 
 // vim: set ts=4 sw=4 et:
